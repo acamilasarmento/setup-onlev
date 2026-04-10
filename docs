@@ -1,0 +1,661 @@
+#!/bin/bash
+
+# =============================================================================
+# Setup Script - Docker Swarm Stack
+# Uso: bash setup.sh <email> <dominio-n8n> <dominio-portainer> <dominio-webhook> <dominio-evolution>
+# =============================================================================
+
+set -e
+
+# ---------- Argumentos ----------
+EMAIL="$1"
+N8N_DOMAIN="$2"
+PORTAINER_DOMAIN="$3"
+WEBHOOK_DOMAIN="$4"
+EVO_DOMAIN="$5"
+
+# ---------- Validação ----------
+if [ -z "$EMAIL" ] || [ -z "$N8N_DOMAIN" ] || [ -z "$PORTAINER_DOMAIN" ] || [ -z "$WEBHOOK_DOMAIN" ] || [ -z "$EVO_DOMAIN" ]; then
+    echo "Uso: bash setup.sh <email> <dominio-n8n> <dominio-portainer> <dominio-webhook> <dominio-evolution>"
+    echo ""
+    echo "Exemplo:"
+    echo "  bash setup.sh admin@meusite.com editor.meusite.com server.meusite.com webhook.meusite.com evo.meusite.com"
+    exit 1
+fi
+
+# ---------- Cores ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ---------- Gerar credenciais ----------
+PORTAINER_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
+POSTGRES_PASSWORD=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 20)
+N8N_ENCRYPTION_KEY=$(openssl rand -hex 32)
+EVOLUTION_API_KEY=$(openssl rand -hex 24)
+SERVER_IP=$(curl -s --connect-timeout 5 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
+
+print_header() {
+    echo ""
+    echo -e "${BLUE}============================================${NC}"
+    echo -e "${BLUE}   $1${NC}"
+    echo -e "${BLUE}============================================${NC}"
+    echo ""
+}
+
+print_step() {
+    echo -e "${YELLOW}>>> $1...${NC}"
+}
+
+print_ok() {
+    echo -e "${GREEN}    [OK] $1${NC}"
+}
+
+print_header "Instalação do Stack Docker Swarm"
+echo -e "Email:      ${CYAN}$EMAIL${NC}"
+echo -e "N8N:        ${CYAN}https://$N8N_DOMAIN${NC}"
+echo -e "Portainer:  ${CYAN}https://$PORTAINER_DOMAIN${NC}"
+echo -e "Webhook:    ${CYAN}https://$WEBHOOK_DOMAIN${NC}"
+echo -e "Evolution:  ${CYAN}https://$EVO_DOMAIN${NC}"
+echo ""
+
+# =============================================================================
+# 1. Instalar Docker
+# =============================================================================
+print_step "Verificando Docker"
+if ! command -v docker &>/dev/null; then
+    print_step "Instalando Docker"
+    curl -fsSL https://get.docker.com | sh
+    systemctl enable docker
+    systemctl start docker
+    print_ok "Docker instalado"
+else
+    print_ok "Docker já instalado ($(docker --version | cut -d' ' -f3 | tr -d ','))"
+fi
+
+# =============================================================================
+# 2. Inicializar Docker Swarm
+# =============================================================================
+print_step "Inicializando Docker Swarm"
+if ! docker info 2>/dev/null | grep -q "Swarm: active"; then
+    docker swarm init --advertise-addr "$SERVER_IP" 2>/dev/null || \
+    docker swarm init --advertise-addr "$(hostname -I | awk '{print $1}')"
+    print_ok "Swarm inicializado"
+else
+    print_ok "Swarm já ativo"
+fi
+
+# =============================================================================
+# 3. Criar rede e volumes
+# =============================================================================
+print_step "Criando rede overlay"
+docker network create --driver=overlay --attachable traefik_public 2>/dev/null && print_ok "Rede criada" || print_ok "Rede já existe"
+
+print_step "Criando volumes persistentes"
+for VOL in portainer_data postgres_data redis_data n8n_data evolution_data traefik_certs; do
+    docker volume create "$VOL" 2>/dev/null || true
+done
+print_ok "Volumes criados"
+
+# =============================================================================
+# 4. Traefik
+# =============================================================================
+print_step "Implantando Traefik (SSL automático)"
+cat > /tmp/stack_traefik.yml << YAML
+version: "3.7"
+
+services:
+  traefik:
+    image: traefik:v2.11
+    command:
+      - "--log.level=ERROR"
+      - "--api.insecure=false"
+      - "--api.dashboard=false"
+      - "--providers.docker=true"
+      - "--providers.docker.swarmMode=true"
+      - "--providers.docker.network=traefik_public"
+      - "--providers.docker.exposedByDefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_certs:/letsencrypt
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+volumes:
+  traefik_certs:
+    external: true
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_traefik.yml traefik --with-registry-auth
+print_ok "Traefik implantado"
+
+# =============================================================================
+# 5. Portainer
+# =============================================================================
+print_step "Implantando Portainer"
+cat > /tmp/stack_portainer.yml << YAML
+version: "3.7"
+
+services:
+  agent:
+    image: portainer/agent:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+    networks:
+      - agent_network
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.platform.os == linux
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    command: -H tcp://tasks.agent:9001 --tlsskipverify
+    volumes:
+      - portainer_data:/data
+    networks:
+      - traefik_public
+      - agent_network
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.portainer.rule=Host(\`${PORTAINER_DOMAIN}\`)"
+        - "traefik.http.routers.portainer.entrypoints=websecure"
+        - "traefik.http.routers.portainer.tls.certresolver=letsencrypt"
+        - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+        - "traefik.docker.network=traefik_public"
+
+volumes:
+  portainer_data:
+    external: true
+
+networks:
+  traefik_public:
+    external: true
+  agent_network:
+    driver: overlay
+    attachable: true
+YAML
+
+docker stack deploy -c /tmp/stack_portainer.yml portainer --with-registry-auth
+print_ok "Portainer implantado"
+
+# Configurar senha do admin via API (aguardar serviço subir)
+print_step "Configurando senha do Portainer (aguardando serviço)"
+PORTAINER_READY=false
+for i in $(seq 1 30); do
+    if curl -s --connect-timeout 2 http://localhost:9000/api/status | grep -q "\"Success\""; then
+        PORTAINER_READY=true
+        break
+    fi
+    sleep 3
+done
+
+if [ "$PORTAINER_READY" = true ]; then
+    curl -s -X POST "http://localhost:9000/api/users/admin/init" \
+        -H "Content-Type: application/json" \
+        -d "{\"Username\":\"admin\",\"Password\":\"${PORTAINER_PASSWORD}\"}" > /dev/null
+    print_ok "Senha do Portainer configurada"
+else
+    echo -e "${YELLOW}    [AVISO] Portainer demorou para subir - configure a senha manualmente${NC}"
+fi
+
+# =============================================================================
+# 6. PostgreSQL
+# =============================================================================
+print_step "Implantando PostgreSQL"
+cat > /tmp/stack_postgres.yml << YAML
+version: "3.7"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+volumes:
+  postgres_data:
+    external: true
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_postgres.yml postgres --with-registry-auth
+print_ok "PostgreSQL implantado"
+
+# Aguardar postgres e criar banco do N8N e Evolution
+print_step "Aguardando PostgreSQL inicializar"
+sleep 15
+POSTGRES_CONTAINER=""
+for i in $(seq 1 20); do
+    POSTGRES_CONTAINER=$(docker ps --filter "name=postgres_postgres" --format "{{.ID}}" | head -1)
+    if [ -n "$POSTGRES_CONTAINER" ]; then
+        if docker exec "$POSTGRES_CONTAINER" pg_isready -U postgres -q 2>/dev/null; then
+            break
+        fi
+    fi
+    sleep 3
+done
+
+if [ -n "$POSTGRES_CONTAINER" ]; then
+    docker exec "$POSTGRES_CONTAINER" psql -U postgres -c "CREATE USER n8n WITH PASSWORD '${POSTGRES_PASSWORD}';" 2>/dev/null || true
+    docker exec "$POSTGRES_CONTAINER" psql -U postgres -c "CREATE DATABASE n8n OWNER n8n;" 2>/dev/null || true
+    docker exec "$POSTGRES_CONTAINER" psql -U postgres -c "CREATE DATABASE evolution;" 2>/dev/null || true
+    docker exec "$POSTGRES_CONTAINER" psql -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE evolution TO postgres;" 2>/dev/null || true
+    print_ok "Bancos de dados criados (n8n, evolution)"
+else
+    echo -e "${YELLOW}    [AVISO] Container postgres não encontrado - crie os bancos manualmente${NC}"
+fi
+
+# =============================================================================
+# 7. Redis
+# =============================================================================
+print_step "Implantando Redis"
+cat > /tmp/stack_redis.yml << YAML
+version: "3.7"
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+volumes:
+  redis_data:
+    external: true
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_redis.yml redis --with-registry-auth
+print_ok "Redis implantado"
+
+# =============================================================================
+# 8. N8N Main
+# =============================================================================
+print_step "Implantando N8N Main"
+cat > /tmp/stack_n8n_main.yml << YAML
+version: "3.7"
+
+services:
+  n8n-main:
+    image: n8nio/n8n:latest
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_HOST=${N8N_DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${WEBHOOK_DOMAIN}/
+      - N8N_EDITOR_BASE_URL=https://${N8N_DOMAIN}/
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+      - N8N_DEFAULT_BINARY_DATA_MODE=filesystem
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.n8n-main.rule=Host(\`${N8N_DOMAIN}\`)"
+        - "traefik.http.routers.n8n-main.entrypoints=websecure"
+        - "traefik.http.routers.n8n-main.tls.certresolver=letsencrypt"
+        - "traefik.http.services.n8n-main.loadbalancer.server.port=5678"
+        - "traefik.docker.network=traefik_public"
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+
+volumes:
+  n8n_data:
+    external: true
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_n8n_main.yml n8n-main --with-registry-auth
+print_ok "N8N Main implantado"
+
+# =============================================================================
+# 9. N8N Webhook
+# =============================================================================
+print_step "Implantando N8N Webhook"
+cat > /tmp/stack_n8n_webhook.yml << YAML
+version: "3.7"
+
+services:
+  n8n-webhook:
+    image: n8nio/n8n:latest
+    command: webhook
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_HOST=${N8N_DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${WEBHOOK_DOMAIN}/
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.n8n-webhook.rule=Host(\`${WEBHOOK_DOMAIN}\`)"
+        - "traefik.http.routers.n8n-webhook.entrypoints=websecure"
+        - "traefik.http.routers.n8n-webhook.tls.certresolver=letsencrypt"
+        - "traefik.http.services.n8n-webhook.loadbalancer.server.port=5678"
+        - "traefik.docker.network=traefik_public"
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_n8n_webhook.yml n8n-webhook --with-registry-auth
+print_ok "N8N Webhook implantado"
+
+# =============================================================================
+# 10. N8N Worker
+# =============================================================================
+print_step "Implantando N8N Worker"
+cat > /tmp/stack_n8n_worker.yml << YAML
+version: "3.7"
+
+services:
+  n8n-worker:
+    image: n8nio/n8n:latest
+    command: worker --concurrency=5
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres_postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n
+      - DB_POSTGRESDB_USER=n8n
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis_redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_HEALTH_CHECK_ACTIVE=true
+      - NODE_ENV=production
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_n8n_worker.yml n8n-worker --with-registry-auth
+print_ok "N8N Worker implantado"
+
+# =============================================================================
+# 11. Evolution API
+# =============================================================================
+print_step "Implantando Evolution API"
+cat > /tmp/stack_evolution.yml << YAML
+version: "3.7"
+
+services:
+  evolution:
+    image: atendai/evolution-api:latest
+    environment:
+      - SERVER_URL=https://${EVO_DOMAIN}
+      - AUTHENTICATION_TYPE=apikey
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://postgres:${POSTGRES_PASSWORD}@postgres_postgres:5432/evolution?schema=public
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_api
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
+      - DATABASE_SAVE_MESSAGE_UPDATE=true
+      - DATABASE_SAVE_DATA_CONTACTS=true
+      - DATABASE_SAVE_DATA_CHATS=true
+      - DATABASE_SAVE_DATA_LABELS=true
+      - DATABASE_SAVE_DATA_HISTORIC=true
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://redis_redis:6379/8
+      - CACHE_REDIS_PREFIX_KEY=evolution
+      - CACHE_REDIS_SAVE_INSTANCES=false
+      - CACHE_LOCAL_ENABLED=false
+      - LOG_LEVEL=ERROR
+      - LOG_COLOR=true
+      - DEL_INSTANCE=false
+    volumes:
+      - evolution_data:/evolution/instances
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.evolution.rule=Host(\`${EVO_DOMAIN}\`)"
+        - "traefik.http.routers.evolution.entrypoints=websecure"
+        - "traefik.http.routers.evolution.tls.certresolver=letsencrypt"
+        - "traefik.http.services.evolution.loadbalancer.server.port=8080"
+        - "traefik.docker.network=traefik_public"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+volumes:
+  evolution_data:
+    external: true
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_evolution.yml evolution --with-registry-auth
+print_ok "Evolution API implantado"
+
+# =============================================================================
+# 12. Evolution Manager
+# =============================================================================
+print_step "Implantando Evolution Manager"
+cat > /tmp/stack_evo_manager.yml << YAML
+version: "3.7"
+
+services:
+  evolution-manager:
+    image: atendai/evolution-manager:latest
+    environment:
+      - EVOLUTION_API_URL=https://${EVO_DOMAIN}
+      - EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
+    networks:
+      - traefik_public
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.evo-manager.rule=Host(\`${EVO_DOMAIN}\`) && PathPrefix(\`/manager\`)"
+        - "traefik.http.routers.evo-manager.entrypoints=websecure"
+        - "traefik.http.routers.evo-manager.tls.certresolver=letsencrypt"
+        - "traefik.http.routers.evo-manager.priority=10"
+        - "traefik.http.services.evo-manager.loadbalancer.server.port=3000"
+        - "traefik.docker.network=traefik_public"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+
+networks:
+  traefik_public:
+    external: true
+YAML
+
+docker stack deploy -c /tmp/stack_evo_manager.yml evolution-manager --with-registry-auth
+print_ok "Evolution Manager implantado"
+
+# =============================================================================
+# Limpeza
+# =============================================================================
+rm -f /tmp/stack_traefik.yml /tmp/stack_portainer.yml /tmp/stack_postgres.yml \
+      /tmp/stack_redis.yml /tmp/stack_n8n_main.yml /tmp/stack_n8n_webhook.yml \
+      /tmp/stack_n8n_worker.yml /tmp/stack_evolution.yml /tmp/stack_evo_manager.yml
+
+# =============================================================================
+# Resultado Final
+# =============================================================================
+echo ""
+echo -e "${GREEN}============================================${NC}"
+echo -e "${GREEN}   SERVIÇOS DISPONÍVEIS                    ${NC}"
+echo -e "${GREEN}============================================${NC}"
+echo ""
+echo -e "  🔧 Portainer:         https://${PORTAINER_DOMAIN}"
+echo -e "  🔄 N8N:               https://${N8N_DOMAIN}"
+echo -e "  ⚡ Evolution API:     https://${EVO_DOMAIN}"
+echo -e "  🖥️  Evolution Manager: https://${EVO_DOMAIN}/manager"
+echo -e "  🔗 Webhook N8N:       https://${WEBHOOK_DOMAIN}"
+echo ""
+echo -e "${YELLOW}============================================${NC}"
+echo -e "${YELLOW}   CREDENCIAIS DE ACESSO                   ${NC}"
+echo -e "${YELLOW}============================================${NC}"
+echo ""
+echo -e "  🔑 Portainer:"
+echo -e "       Admin: admin"
+echo -e "       Senha: ${PORTAINER_PASSWORD}"
+echo ""
+echo -e "  🔑 PostgreSQL Password: ${POSTGRES_PASSWORD}"
+echo -e "  🔑 N8N Encryption Key:  ${N8N_ENCRYPTION_KEY}"
+echo -e "  🔑 Evolution API Key:   ${EVOLUTION_API_KEY}"
+echo ""
+echo -e "${BLUE}============================================${NC}"
+echo -e "${BLUE}   INFORMAÇÕES IMPORTANTES                  ${NC}"
+echo -e "${BLUE}============================================${NC}"
+echo ""
+echo -e "  ✅ SSL processado automaticamente"
+echo -e "  ✅ Redirecionamento HTTP→HTTPS ativo"
+echo -e "  ✅ Portainer admin criado"
+echo -e "  🌐 IP do servidor: ${SERVER_IP}"
+echo ""
+echo -e "${RED}  ⚠️  SALVE ESSAS CREDENCIAIS EM LOCAL SEGURO!${NC}"
+echo ""
+echo -e "${YELLOW}  Aguarde 2-3 minutos para os certificados SSL serem emitidos.${NC}"
+echo ""
