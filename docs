@@ -5,7 +5,7 @@
 # Uso: bash setup.sh <email> <dominio-n8n> <dominio-portainer> <dominio-webhook> <dominio-evolution>
 # =============================================================================
 
-set -e
+set -euo pipefail
 
 # ---------- Argumentos ----------
 EMAIL="$1"
@@ -31,7 +31,19 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# ---------- Gerar credenciais ----------
+# ---------- Gerar e exportar credenciais ----------
+# Exportar todas as variáveis para o envsubst processar os YAMLs
+export EMAIL
+export N8N_DOMAIN
+export PORTAINER_DOMAIN
+export WEBHOOK_DOMAIN
+export EVO_DOMAIN
+export PORTAINER_PASSWORD
+export POSTGRES_PASSWORD
+export N8N_ENCRYPTION_KEY
+export EVOLUTION_API_KEY
+export SERVER_IP
+
 PORTAINER_PASSWORD=$(openssl rand -base64 12 | tr -dc 'a-zA-Z0-9' | head -c 16)
 POSTGRES_PASSWORD=$(openssl rand -base64 16 | tr -dc 'a-zA-Z0-9' | head -c 20)
 N8N_ENCRYPTION_KEY=$(openssl rand -hex 32)
@@ -104,7 +116,10 @@ print_ok "Volumes criados"
 # 4. Traefik
 # =============================================================================
 print_step "Implantando Traefik (SSL automático)"
-cat > /tmp/stack_traefik.yml << YAML
+
+# Nota: usamos << 'YAML' (aspas simples) para evitar que o bash interprete
+# backticks e cifrões no conteúdo. O envsubst faz a substituição de variáveis.
+cat << 'YAML' | envsubst > /tmp/stack_traefik.yml
 version: "3.7"
 
 services:
@@ -166,7 +181,8 @@ print_ok "Traefik implantado"
 # 5. Portainer
 # =============================================================================
 print_step "Implantando Portainer"
-cat > /tmp/stack_portainer.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_portainer.yml
 version: "3.7"
 
 services:
@@ -199,10 +215,12 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.portainer.rule=Host(\`${PORTAINER_DOMAIN}\`)"
+        - "traefik.http.routers.portainer.rule=Host(`${PORTAINER_DOMAIN}`)"
         - "traefik.http.routers.portainer.entrypoints=websecure"
+        - "traefik.http.routers.portainer.tls=true"
         - "traefik.http.routers.portainer.tls.certresolver=letsencrypt"
         - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+        - "traefik.http.services.portainer.loadbalancer.server.scheme=http"
         - "traefik.docker.network=traefik_public"
 
 volumes:
@@ -220,11 +238,10 @@ YAML
 docker stack deploy -c /tmp/stack_portainer.yml portainer --with-registry-auth
 print_ok "Portainer implantado"
 
-# Configurar senha do admin via API (aguardar serviço subir)
 print_step "Configurando senha do Portainer (aguardando serviço)"
 PORTAINER_READY=false
 for i in $(seq 1 30); do
-    if curl -s --connect-timeout 2 http://localhost:9000/api/status | grep -q "\"Success\""; then
+    if curl -s --connect-timeout 2 http://localhost:9000/api/status | grep -q '"Success"'; then
         PORTAINER_READY=true
         break
     fi
@@ -244,7 +261,8 @@ fi
 # 6. PostgreSQL
 # =============================================================================
 print_step "Implantando PostgreSQL"
-cat > /tmp/stack_postgres.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_postgres.yml
 version: "3.7"
 
 services:
@@ -280,7 +298,6 @@ YAML
 docker stack deploy -c /tmp/stack_postgres.yml postgres --with-registry-auth
 print_ok "PostgreSQL implantado"
 
-# Aguardar postgres e criar banco do N8N e Evolution
 print_step "Aguardando PostgreSQL inicializar"
 sleep 15
 POSTGRES_CONTAINER=""
@@ -308,7 +325,8 @@ fi
 # 7. Redis
 # =============================================================================
 print_step "Implantando Redis"
-cat > /tmp/stack_redis.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_redis.yml
 version: "3.7"
 
 services:
@@ -345,7 +363,8 @@ print_ok "Redis implantado"
 # 8. N8N Main
 # =============================================================================
 print_step "Implantando N8N Main"
-cat > /tmp/stack_n8n_main.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_n8n_main.yml
 version: "3.7"
 
 services:
@@ -383,8 +402,9 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.n8n-main.rule=Host(\`${N8N_DOMAIN}\`)"
+        - "traefik.http.routers.n8n-main.rule=Host(`${N8N_DOMAIN}`)"
         - "traefik.http.routers.n8n-main.entrypoints=websecure"
+        - "traefik.http.routers.n8n-main.tls=true"
         - "traefik.http.routers.n8n-main.tls.certresolver=letsencrypt"
         - "traefik.http.services.n8n-main.loadbalancer.server.port=5678"
         - "traefik.docker.network=traefik_public"
@@ -408,7 +428,8 @@ print_ok "N8N Main implantado"
 # 9. N8N Webhook
 # =============================================================================
 print_step "Implantando N8N Webhook"
-cat > /tmp/stack_n8n_webhook.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_n8n_webhook.yml
 version: "3.7"
 
 services:
@@ -443,8 +464,9 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.n8n-webhook.rule=Host(\`${WEBHOOK_DOMAIN}\`)"
+        - "traefik.http.routers.n8n-webhook.rule=Host(`${WEBHOOK_DOMAIN}`)"
         - "traefik.http.routers.n8n-webhook.entrypoints=websecure"
+        - "traefik.http.routers.n8n-webhook.tls=true"
         - "traefik.http.routers.n8n-webhook.tls.certresolver=letsencrypt"
         - "traefik.http.services.n8n-webhook.loadbalancer.server.port=5678"
         - "traefik.docker.network=traefik_public"
@@ -464,7 +486,8 @@ print_ok "N8N Webhook implantado"
 # 10. N8N Worker
 # =============================================================================
 print_step "Implantando N8N Worker"
-cat > /tmp/stack_n8n_worker.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_n8n_worker.yml
 version: "3.7"
 
 services:
@@ -509,7 +532,8 @@ print_ok "N8N Worker implantado"
 # 11. Evolution API
 # =============================================================================
 print_step "Implantando Evolution API"
-cat > /tmp/stack_evolution.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_evolution.yml
 version: "3.7"
 
 services:
@@ -551,8 +575,9 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.evolution.rule=Host(\`${EVO_DOMAIN}\`)"
+        - "traefik.http.routers.evolution.rule=Host(`${EVO_DOMAIN}`)"
         - "traefik.http.routers.evolution.entrypoints=websecure"
+        - "traefik.http.routers.evolution.tls=true"
         - "traefik.http.routers.evolution.tls.certresolver=letsencrypt"
         - "traefik.http.services.evolution.loadbalancer.server.port=8080"
         - "traefik.docker.network=traefik_public"
@@ -576,7 +601,8 @@ print_ok "Evolution API implantado"
 # 12. Evolution Manager
 # =============================================================================
 print_step "Implantando Evolution Manager"
-cat > /tmp/stack_evo_manager.yml << YAML
+
+cat << 'YAML' | envsubst > /tmp/stack_evo_manager.yml
 version: "3.7"
 
 services:
@@ -595,8 +621,9 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.evo-manager.rule=Host(\`${EVO_DOMAIN}\`) && PathPrefix(\`/manager\`)"
+        - "traefik.http.routers.evo-manager.rule=Host(`${EVO_DOMAIN}`) && PathPrefix(`/manager`)"
         - "traefik.http.routers.evo-manager.entrypoints=websecure"
+        - "traefik.http.routers.evo-manager.tls=true"
         - "traefik.http.routers.evo-manager.tls.certresolver=letsencrypt"
         - "traefik.http.routers.evo-manager.priority=10"
         - "traefik.http.services.evo-manager.loadbalancer.server.port=3000"
@@ -628,34 +655,33 @@ echo -e "${GREEN}============================================${NC}"
 echo -e "${GREEN}   SERVIÇOS DISPONÍVEIS                    ${NC}"
 echo -e "${GREEN}============================================${NC}"
 echo ""
-echo -e "  🔧 Portainer:         https://${PORTAINER_DOMAIN}"
-echo -e "  🔄 N8N:               https://${N8N_DOMAIN}"
-echo -e "  ⚡ Evolution API:     https://${EVO_DOMAIN}"
-echo -e "  🖥️  Evolution Manager: https://${EVO_DOMAIN}/manager"
-echo -e "  🔗 Webhook N8N:       https://${WEBHOOK_DOMAIN}"
+echo -e "  Portainer:         https://${PORTAINER_DOMAIN}"
+echo -e "  N8N:               https://${N8N_DOMAIN}"
+echo -e "  Evolution API:     https://${EVO_DOMAIN}"
+echo -e "  Evolution Manager: https://${EVO_DOMAIN}/manager"
+echo -e "  Webhook N8N:       https://${WEBHOOK_DOMAIN}"
 echo ""
 echo -e "${YELLOW}============================================${NC}"
 echo -e "${YELLOW}   CREDENCIAIS DE ACESSO                   ${NC}"
 echo -e "${YELLOW}============================================${NC}"
 echo ""
-echo -e "  🔑 Portainer:"
-echo -e "       Admin: admin"
-echo -e "       Senha: ${PORTAINER_PASSWORD}"
+echo -e "  Portainer Admin:        admin"
+echo -e "  Portainer Senha:        ${PORTAINER_PASSWORD}"
 echo ""
-echo -e "  🔑 PostgreSQL Password: ${POSTGRES_PASSWORD}"
-echo -e "  🔑 N8N Encryption Key:  ${N8N_ENCRYPTION_KEY}"
-echo -e "  🔑 Evolution API Key:   ${EVOLUTION_API_KEY}"
+echo -e "  PostgreSQL Password:    ${POSTGRES_PASSWORD}"
+echo -e "  N8N Encryption Key:     ${N8N_ENCRYPTION_KEY}"
+echo -e "  Evolution API Key:      ${EVOLUTION_API_KEY}"
 echo ""
 echo -e "${BLUE}============================================${NC}"
-echo -e "${BLUE}   INFORMAÇÕES IMPORTANTES                  ${NC}"
+echo -e "${BLUE}   INFORMACOES IMPORTANTES                  ${NC}"
 echo -e "${BLUE}============================================${NC}"
 echo ""
-echo -e "  ✅ SSL processado automaticamente"
-echo -e "  ✅ Redirecionamento HTTP→HTTPS ativo"
-echo -e "  ✅ Portainer admin criado"
-echo -e "  🌐 IP do servidor: ${SERVER_IP}"
+echo -e "  SSL processado automaticamente"
+echo -e "  Redirecionamento HTTP para HTTPS ativo"
+echo -e "  Portainer admin criado"
+echo -e "  IP do servidor: ${SERVER_IP}"
 echo ""
-echo -e "${RED}  ⚠️  SALVE ESSAS CREDENCIAIS EM LOCAL SEGURO!${NC}"
+echo -e "${RED}  SALVE ESSAS CREDENCIAIS EM LOCAL SEGURO!${NC}"
 echo ""
 echo -e "${YELLOW}  Aguarde 2-3 minutos para os certificados SSL serem emitidos.${NC}"
 echo ""
